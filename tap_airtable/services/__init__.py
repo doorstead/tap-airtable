@@ -31,22 +31,26 @@ class Airtable(object):
     logger = singer.get_logger()
     session = init_session()
 
+    pk_types = ["autoNumber"]
+
     @classmethod
     def run_discovery(cls, args):
         cls.__apply_config(args.config)
-        if "base_id" in args.config:
-            base_id = args.config['base_id']
-            entries = cls.discover_base(base_id)
-            return Catalog(entries).dump()
-
-        bases = cls.__get_base_ids()
         entries = []
 
-        for base in bases:
-            entries.extend(cls.discover_base(base["id"], base["name"]))
-            if args.config.get("validate_only", False):
-                break
-        return Catalog(entries).dump()
+        if "base_ids" in args.config:
+            for base_id in args.config["base_ids"]:
+                entries.extend(cls.discover_base(base_id))
+
+            return Catalog(entries).dump()
+        else: 
+            bases = cls.__get_base_ids()
+
+            for base in bases:
+                entries.extend(cls.discover_base(base["id"], base["name"]))
+                if args.config.get("validate_only", False):
+                    break
+            return Catalog(entries).dump()
 
     @classmethod
     def __apply_config(cls, config):
@@ -84,9 +88,12 @@ class Airtable(object):
         response.raise_for_status()
         entries = []
 
+        # airtable always has an id field by default
+        key_properties = ["id"]
+
+        # treat each table as a stream
         for table in response.json()["tables"]:
             schema_cols = {"id": Schema(inclusion="automatic", type=['null', "string"])}
-
             meta = {}
 
             table_name = table["name"]
@@ -97,21 +104,26 @@ class Airtable(object):
             for field in table["fields"]:
                 # numbers are not allowed at the start of column name in big query
                 # check if the name starts with digit, keep the same naming but add a character before
-                field_name = field["name"]
-                if field["name"][0].isdigit():
-                    field_name = "c_" + field_name
+                airtable_field = field["name"]
+                field_name = airtable_field
+                if airtable_field[0].isdigit():
+                    field_name = "c_" + airtable_field
 
                 col_schema = cls.column_schema(field)
-                if col_schema.inclusion == "automatic":
-                    keys.append(field_name)
 
                 schema_cols[field_name] = col_schema
 
+                if "config" in field and "type" in field["config"]:
+                    if field["config"]["type"] in cls.pk_types:
+                        meta = metadata.write(meta, (
+                            'properties', field_name), 'inclusion', 'available')
+
                 meta = metadata.write(meta, (
-                    'properties', field_name, field['id'], field['name']), 'inclusion', 'available')
-                meta = metadata.write(meta, (
-                    'properties', field_name, field['id'], field['name']), 'airtable_type',
+                    'properties', field_name), 'airtable_type',
                                       field["config"]["type"] or None)
+                meta = metadata.write(meta, (
+                    'properties', field_name), 'airtable_field',
+                                      airtable_field)
 
             schema = Schema(type='object', properties=schema_cols)
             entry = CatalogEntry(
@@ -131,18 +143,13 @@ class Airtable(object):
     def column_schema(cls, col_info):
         date_types = ["dateTime"]
         number_types = ["number", "autoNumber"]
-        pk_types = ["autoNumber"]
 
         air_type = "string"
 
         if "config" in col_info and "type" in col_info["config"]:
             air_type = col_info["config"]["type"]
 
-        inclusion = "available"
-        if air_type in pk_types:
-            inclusion = "automatic"
-
-        schema = Schema(inclusion=inclusion)
+        schema = Schema()
 
         singer_type = 'string'
         if air_type in number_types:
@@ -168,23 +175,26 @@ class Airtable(object):
     @classmethod
     def _find_selected_columns(cls, schema):
         selected_cols = {}
-        fields = []
+        airtable_fields = []
         for m in schema["metadata"]:
             if "properties" not in m["breadcrumb"]:
                 continue
 
-            if "selected" in m["metadata"] and m["metadata"]["selected"]:
+            if "selected" in m["metadata"] and m["metadata"]["selected"] and "airtable_field" in m["metadata"]:
                 column_name = m["breadcrumb"][1]
-                field = m["breadcrumb"][3]
+                airtable_field = m["metadata"]["airtable_field"]
                 selected_cols[column_name] = schema["schema"]["properties"][column_name]
-                fields.append(field)
-        return selected_cols, fields
+                airtable_fields.append(airtable_field)
+        return selected_cols, airtable_fields
 
     @classmethod
     def _find_column(cls, col, meta_data):
         for m in meta_data:
             if "breadcrumb" in m and "properties" in m["breadcrumb"] and m["breadcrumb"][1] == col:
-                return m["breadcrumb"][3]
+                if "metadata" in m and "airtable_field" in m["metadata"]:
+                    return m["metadata"]["airtable_field"]
+                else: 
+                    return None
 
     @classmethod
     def run_sync(cls, config, properties):
@@ -201,39 +211,38 @@ class Airtable(object):
             col_defs, fields = cls._find_selected_columns(stream)
 
             counter = 0
-            if len(col_defs) > 0:
-                cls.logger.info("will import " + table)
+            cls.logger.info("will import " + table)
 
-                response = Airtable.get_response(base_id, table, fields, counter=counter)
-                records = response.json().get('records')
+            response = Airtable.get_response(base_id, table, fields, counter=counter)
+            records = response.json().get('records')
 
-                if records:
-                    col_schema = deepcopy(col_defs)
-                    col_schema["id"] = schema["id"]
-                    singer.write_schema(table_slug, {"properties": col_schema}, stream["key_properties"])
-                    singer.write_records(table_slug, cls._map_records(stream, records))
-                    offset = response.json().get("offset")
+            if records:
+                col_schema = deepcopy(col_defs)
+                col_schema["id"] = schema["id"]
+                singer.write_schema(table_slug, {"properties": col_schema}, stream["key_properties"])
+                singer.write_records(table_slug, cls._map_records(stream, records))
+                offset = response.json().get("offset")
 
-                    while offset:
-                        counter += 1
-                        response = Airtable.get_response(base_id, table, fields, offset, counter=counter)
-                        records = response.json().get('records')
-                        if records:
-                            singer.write_records(table_slug, cls._map_records(stream, records))
-                            offset = response.json().get("offset")
+                while offset:
+                    counter += 1
+                    response = Airtable.get_response(base_id, table, fields, offset, counter=counter)
+                    records = response.json().get('records')
+                    if records:
+                        singer.write_records(table_slug, cls._map_records(stream, records))
+                        offset = response.json().get("offset")
 
     @classmethod
     def _map_records(cls, stream, records):
         mapped = []
         schema = stream["schema"]["properties"]
-        meta_data = stream["metadata"]
+        metadata = stream["metadata"]
         for r in records:
             row = {}
             for col in schema:
                 col_def = schema[col]
-                requested_type = col_def["type"][1] or "string"
+                requested_type = col_def["type"][1]
 
-                col_name = cls._find_column(col, meta_data) or col
+                col_name = cls._find_column(col, metadata) or col
                 val = r["fields"].get(col_name)
                 if val is not None:
                     val = cls.cast_type(val, requested_type)
